@@ -20,8 +20,9 @@ import subprocess
 import urllib.request
 import json
 import time
+import struct
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_PORT = 8080
 FLCLASH_PORT = 7890
 XRAY_PORT = 10809
@@ -294,6 +295,55 @@ def connect_upstream(host, port, forced_mode='auto'):
         mode_label = f"VPN ({vpn_dev})" if vpn_dev else "Direct"
         return s, mode_label, b""
 
+def handle_socks5(client_sock, client_addr, peek_data, forced_mode='auto'):
+    """Handle SOCKS5 proxy handshake (Used by Telegram, Outline, SOCKS5 clients)."""
+    remote_sock = None
+    try:
+        # SOCKS5 greeting: client sends [VER=0x05, NMETHODS, METHODS...]
+        # Reply No Authentication required: [VER=0x05, METHOD=0x00]
+        client_sock.sendall(b"\x05\x00")
+
+        # Read SOCKS5 connection request
+        req = client_sock.recv(512)
+        if len(req) < 7 or req[0] != 0x05 or req[1] != 0x01:
+            return
+
+        atyp = req[3]
+        if atyp == 1:  # IPv4
+            host = socket.inet_ntoa(req[4:8])
+            port = struct.unpack("!H", req[8:10])[0]
+        elif atyp == 3:  # Domain
+            dlen = req[4]
+            host = req[5:5+dlen].decode('utf-8', errors='ignore')
+            port = struct.unpack("!H", req[5+dlen:5+dlen+2])[0]
+        elif atyp == 4:  # IPv6
+            host = socket.inet_ntop(socket.AF_INET6, req[4:20])
+            port = struct.unpack("!H", req[20:22])[0]
+        else:
+            return
+
+        remote_sock, route_mode, leftover = connect_upstream(host, port, forced_mode)
+        try:
+            remote_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+        # Send SOCKS5 success reply: [VER=0x05, REP=0x00, RSV=0x00, ATYP=0x01, BND.ADDR=0.0.0.0, BND.PORT=0]
+        client_sock.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        print(f"  \033[90m📱 [{client_addr[0]}]\033[0m \033[36m✈️ SOCKS5\033[0m {host}:{port} \033[36m[{route_mode}]\033[0m")
+        sys.stdout.flush()
+
+        tunnel(client_sock, remote_sock, leftover=leftover)
+    except Exception:
+        pass
+    finally:
+        for s in (client_sock, remote_sock):
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
 def handle_client(client_sock, client_addr, forced_mode='auto'):
     remote_sock = None
     try:
@@ -307,7 +357,12 @@ def handle_client(client_sock, client_addr, forced_mode='auto'):
         if not peek_data:
             return
 
-        # Case 1: Raw TLS Handshake (WhatsApp In-App Proxy or direct TLS)
+        # Case 1: SOCKS5 Protocol (Telegram Proxy, Outline, SOCKS5 clients)
+        if peek_data[0] == 0x05:
+            handle_socks5(client_sock, client_addr, peek_data, forced_mode)
+            return
+
+        # Case 2: Raw TLS Handshake (WhatsApp In-App Proxy or direct TLS)
         if peek_data[0] == 0x16:
             sni = parse_sni(peek_data) or "g.whatsapp.net"
             remote_sock, route_mode, leftover = connect_upstream(sni, 443, forced_mode)
@@ -483,10 +538,15 @@ def main():
         print(f"  \033[1;33m⚠️  Notice: Port {requested_port} was occupied. Automatically selected port {actual_port}!\033[0m\n")
 
     print("  \033[1m📱 CONFIGURE YOUR PHONE:\033[0m\n")
-    print("     \033[1;33m[Method 1 - Standard iPhone Wi-Fi Proxy]\033[0m")
+    print("     \033[1;33m[Method 1 - Standard Wi-Fi Proxy (Safari, Browser, Web)]\033[0m")
     print(f"       • Server (IP) :  \033[1;32m{local_ip}\033[0m")
     print(f"       • Port        :  \033[1;32m{actual_port}\033[0m")
-    print("\n     \033[1;33m[Method 2 - WhatsApp In-App Proxy (Settings -> Storage -> Proxy)]\033[0m")
+    print("\n     \033[1;33m[Method 2 - Telegram Proxy (Settings -> Data & Storage -> Proxy Settings)]\033[0m")
+    print(f"       • Type        :  \033[1;32mSOCKS5\033[0m")
+    print(f"       • Server (IP) :  \033[1;32m{local_ip}\033[0m")
+    print(f"       • Port        :  \033[1;32m{actual_port}\033[0m")
+    print(f"       • Credentials :  \033[90m(Leave Empty)\033[0m")
+    print("\n     \033[1;33m[Method 3 - WhatsApp In-App Proxy (Settings -> Storage -> Proxy)]\033[0m")
     print(f"       • Proxy IP    :  \033[1;32m{local_ip}\033[0m")
     print(f"       • Chat Port   :  \033[1;32m{actual_port}\033[0m")
     print("\033[1;36m" + "-" * 68 + "\033[0m")
